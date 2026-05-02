@@ -3,6 +3,8 @@ from datetime import datetime, timedelta
 import threading
 import time
 import requests
+import json
+import os
 
 app = Flask(__name__)
 
@@ -10,10 +12,39 @@ app = Flask(__name__)
 ADD_API_URL = "https://riyad-add.vercel.app/add"
 REMOVE_API_URL = "https://riyad-remove.vercel.app/remove"
 
+# ملف التخزين
+STORAGE_FILE = "uid_storage.json"
+
 # ذاكرة مؤقتة لتخزين الـ UIDs ووقت انتهائها
 uids_cache = {}
 cache_lock = threading.Lock()
 CLEANUP_INTERVAL = 60  # فحص كل 60 ثانية
+
+def load_uids_from_file():
+    """تحميل الـ UIDs من ملف التخزين"""
+    global uids_cache
+    if os.path.exists(STORAGE_FILE):
+        try:
+            with open(STORAGE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                uids_cache = data
+                print(f"✅ تم تحميل {len(uids_cache)} UID من الملف")
+        except Exception as e:
+            print(f"❌ خطأ في تحميل الملف: {e}")
+            uids_cache = {}
+    else:
+        print("📁 لا يوجد ملف سابق، سيتم إنشاء ملف جديد")
+        uids_cache = {}
+
+def save_uids_to_file():
+    """حفظ الـ UIDs في ملف التخزين"""
+    try:
+        with open(STORAGE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(uids_cache, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"❌ خطأ في حفظ الملف: {e}")
+        return False
 
 def add_uid_to_api(uid: str, time_value: int = None, time_unit: str = None, permanent: bool = False):
     """إرسال طلب إضافة UID إلى واجهة /add"""
@@ -72,6 +103,7 @@ def cleanup_expired_uids():
                 with cache_lock:
                     if uid in uids_cache:
                         del uids_cache[uid]
+                        save_uids_to_file()  # حفظ التغييرات بعد الحذف
                 print(f"✅ تم حذف الـ UID منتهي الصلاحية: {uid}")
 
 # بدء خيط التنظيف التلقائي
@@ -89,7 +121,7 @@ def add_uid():
     - /add_uid?uid=123&permanent=true          (دائم)
     - /add_uid?uid=123&time=5&type=days        (5 أيام)
     - /add_uid?uid=123&time=30&type=minutes    (30 دقيقة)
-    - /add_uid?uid=123&time=2&type=hours       (2 ساعة) ← جديد!
+    - /add_uid?uid=123&time=2&type=hours       (2 ساعة)
     - /add_uid?uid=123&time=30&type=seconds    (30 ثانية)
     """
     uid = request.args.get('uid')
@@ -119,7 +151,7 @@ def add_uid():
         time_units = {
             'seconds': timedelta(seconds=time_value),
             'minutes': timedelta(minutes=time_value),
-            'hours': timedelta(hours=time_value),      # ← تمت الإضافة
+            'hours': timedelta(hours=time_value),
             'days': timedelta(days=time_value),
             'months': timedelta(days=time_value * 30),
             'years': timedelta(days=time_value * 365)
@@ -131,10 +163,11 @@ def add_uid():
         expiry_time = (current_time + time_units[time_unit]).strftime('%Y-%m-%d %H:%M:%S')
         result, status = add_uid_to_api(uid, time_value, time_unit)
     
-    # تخزين في الكاش المؤقت
+    # تخزين في الكاش المؤقت والملف
     if status == 200:
         with cache_lock:
             uids_cache[uid] = expiry_time
+            save_uids_to_file()  # حفظ التغييرات بعد الإضافة
         return jsonify({
             'message': '✅ تم إضافة UID بنجاح',
             'uid': uid,
@@ -194,21 +227,56 @@ def delete_uid(uid):
     if delete_uid_from_api(uid):
         with cache_lock:
             uids_cache.pop(uid, None)
+            save_uids_to_file()  # حفظ التغييرات بعد الحذف
         return jsonify({'message': f'✅ تم حذف الـ UID {uid}'})
     else:
         return jsonify({'error': f'❌ فشل حذف الـ UID {uid} - تأكد من صحة الرابط'}), 500
 
 @app.route('/list_uids', methods=['GET'])
 def list_uids():
-    """عرض جميع الـ UIDs المخزنة مؤقتاً"""
+    """عرض جميع الـ UIDs المخزنة"""
     with cache_lock:
         uids_list = list(uids_cache.keys())
-    return jsonify({'total': len(uids_list), 'uids': uids_list})
+        uids_details = {}
+        for uid, expiry in uids_cache.items():
+            uids_details[uid] = {
+                'expiry': expiry,
+                'is_permanent': expiry == 'permanent'
+            }
+    return jsonify({
+        'total': len(uids_list), 
+        'uids': uids_list,
+        'details': uids_details
+    })
+
+@app.route('/backup', methods=['GET'])
+def backup_data():
+    """عمل نسخة احتياطية من البيانات"""
+    with cache_lock:
+        backup_data = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_uids': len(uids_cache),
+            'data': uids_cache.copy()
+        }
+    
+    try:
+        backup_file = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(backup_file, 'w', encoding='utf-8') as f:
+            json.dump(backup_data, f, ensure_ascii=False, indent=2)
+        
+        return jsonify({
+            'message': '✅ تم إنشاء النسخة الاحتياطية',
+            'file': backup_file,
+            'total_uids': len(uids_cache)
+        })
+    except Exception as e:
+        return jsonify({'error': f'فشل إنشاء النسخة: {e}'}), 500
 
 @app.route('/')
 def home():
     return jsonify({
         'service': '🚀 UID Manager',
+        'storage_file': STORAGE_FILE,
         'add_api': ADD_API_URL,
         'remove_api': REMOVE_API_URL,
         'supported_time_units': ['seconds', 'minutes', 'hours', 'days', 'months', 'years'],
@@ -216,31 +284,38 @@ def home():
             'add_permanent': '/add_uid?uid=ID&permanent=true',
             'add_seconds': '/add_uid?uid=ID&time=30&type=seconds',
             'add_minutes': '/add_uid?uid=ID&time=5&type=minutes',
-            'add_hours': '/add_uid?uid=ID&time=2&type=hours',      # ← جديد!
+            'add_hours': '/add_uid?uid=ID&time=2&type=hours',
             'add_days': '/add_uid?uid=ID&time=5&type=days',
             'add_months': '/add_uid?uid=ID&time=1&type=months',
             'add_years': '/add_uid?uid=ID&time=1&type=years',
             'check': '/remaining_time/ID',
             'delete': '/delete_uid/ID',
-            'list': '/list_uids'
+            'list': '/list_uids',
+            'backup': '/backup'
         }
     })
 
 if __name__ == '__main__':
+    # تحميل البيانات المحفوظة عند بدء التشغيل
+    load_uids_from_file()
+    
     print("\n" + "="*60)
-    print("🚀 UID MANAGER - مع دعم الساعات")
+    print("🚀 UID MANAGER - مع حفظ البيانات في ملف")
     print("="*60)
-    print(f"\n📡 واجهة الإضافة: {ADD_API_URL}")
+    print(f"\n📁 ملف التخزين: {STORAGE_FILE}")
+    print(f"📡 واجهة الإضافة: {ADD_API_URL}")
     print(f"📡 واجهة الحذف: {REMOVE_API_URL}")
+    print(f"\n📊 تم تحميل {len(uids_cache)} UID من الملف")
     print("\n📋 أوامر الإضافة:")
     print("   /add_uid?uid=123&permanent=true        (دائم)")
     print("   /add_uid?uid=123&time=30&type=seconds  (30 ثانية)")
     print("   /add_uid?uid=123&time=5&type=minutes   (5 دقائق)")
-    print("   /add_uid?uid=123&time=2&type=hours     (2 ساعة) ← جديد!")
+    print("   /add_uid?uid=123&time=2&type=hours     (2 ساعة)")
     print("   /add_uid?uid=123&time=5&type=days      (5 أيام)")
     print("\n📋 أوامر أخرى:")
     print("   /remaining_time/123")
     print("   /delete_uid/123")
     print("   /list_uids")
+    print("   /backup                           (نسخة احتياطية)")
     print("\n" + "="*60)
     app.run(host='0.0.0.0', port=50022, debug=False)
