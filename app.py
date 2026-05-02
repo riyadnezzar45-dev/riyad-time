@@ -29,18 +29,22 @@ def load_uids_from_file():
                 data = json.load(f)
                 uids_cache = data
                 print(f"✅ تم تحميل {len(uids_cache)} UID من الملف")
+                return True
         except Exception as e:
             print(f"❌ خطأ في تحميل الملف: {e}")
             uids_cache = {}
+            return False
     else:
         print("📁 لا يوجد ملف سابق، سيتم إنشاء ملف جديد")
         uids_cache = {}
+        return False
 
 def save_uids_to_file():
     """حفظ الـ UIDs في ملف التخزين"""
     try:
         with open(STORAGE_FILE, 'w', encoding='utf-8') as f:
             json.dump(uids_cache, f, ensure_ascii=False, indent=2)
+        print(f"💾 تم حفظ {len(uids_cache)} UID في الملف")
         return True
     except Exception as e:
         print(f"❌ خطأ في حفظ الملف: {e}")
@@ -60,24 +64,26 @@ def add_uid_to_api(uid: str, time_value: int = None, time_unit: str = None, perm
     
     try:
         response = requests.get(api_url, timeout=10)
+        print(f"📤 إرسال طلب إضافة {uid} إلى API")
         return response.json(), response.status_code
     except Exception as e:
+        print(f"❌ فشل الاتصال بـ API الإضافة: {e}")
         return {"error": f"فشل الاتصال بـ API الإضافة: {str(e)}"}, 500
 
 def delete_uid_from_api(uid: str) -> bool:
-    """إرسال طلب حذف UID إلى واجهة /uid باستخدام المعامل uid"""
+    """إرسال طلب حذف UID إلى واجهة /remove"""
     url = f"{REMOVE_API_URL}?uid={uid}"
     
     try:
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
-            print(f"تم حذف {uid} بنجاح باستخدام: {url}")
+            print(f"🗑️ تم حذف {uid} بنجاح من API")
             return True
-        
-        print(f"فشل حذف {uid}. استجابة الخادم: {response.status_code}")
-        return False
+        else:
+            print(f"⚠️ فشل حذف {uid} من API. الحالة: {response.status_code}")
+            return False
     except Exception as e:
-        print(f"خطأ في حذف {uid}: {e}")
+        print(f"❌ خطأ في حذف {uid} من API: {e}")
         return False
 
 def cleanup_expired_uids():
@@ -95,16 +101,21 @@ def cleanup_expired_uids():
                     exp_time = datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
                     if current_time > exp_time:
                         expired_uids.append(uid)
-                except:
+                        print(f"⏰ وجدت UID منتهي الصلاحية: {uid}")
+                except Exception as e:
+                    print(f"⚠️ خطأ في معالجة {uid}: {e}")
                     pass
         
+        # حذف الـ UIDs منتهية الصلاحية
         for uid in expired_uids:
             if delete_uid_from_api(uid):
                 with cache_lock:
                     if uid in uids_cache:
                         del uids_cache[uid]
-                        save_uids_to_file()  # حفظ التغييرات بعد الحذف
+                        save_uids_to_file()
                 print(f"✅ تم حذف الـ UID منتهي الصلاحية: {uid}")
+            else:
+                print(f"❌ فشل حذف {uid} من API، سيتم المحاولة مرة أخرى لاحقاً")
 
 # بدء خيط التنظيف التلقائي
 cleanup_thread = threading.Thread(target=cleanup_expired_uids, daemon=True)
@@ -132,22 +143,24 @@ def add_uid():
     if not uid:
         return jsonify({'error': '❌ الرجاء إدخال uid'}), 400
     
-    # تخزين وقت الإضافة لحساب الانتهاء لاحقاً
     current_time = datetime.now()
     
     if permanent:
         expiry_time = 'permanent'
         result, status = add_uid_to_api(uid, permanent=True)
+        time_display = "دائم"
     else:
         if not time_value or not time_unit:
             return jsonify({'error': '❌ الرجاء إدخال time و type'}), 400
         
         try:
             time_value = int(time_value)
+            if time_value <= 0:
+                return jsonify({'error': '❌ الوقت يجب أن يكون أكبر من 0'}), 400
         except ValueError:
             return jsonify({'error': '❌ الوقت يجب أن يكون رقماً'}), 400
         
-        # حساب وقت الانتهاء للتخزين المؤقت
+        # حساب وقت الانتهاء
         time_units = {
             'seconds': timedelta(seconds=time_value),
             'minutes': timedelta(minutes=time_value),
@@ -162,22 +175,27 @@ def add_uid():
         
         expiry_time = (current_time + time_units[time_unit]).strftime('%Y-%m-%d %H:%M:%S')
         result, status = add_uid_to_api(uid, time_value, time_unit)
+        time_display = f"{time_value} {time_unit}"
     
-    # تخزين في الكاش المؤقت والملف
+    # تخزين في الكاش والملف
     if status == 200:
         with cache_lock:
             uids_cache[uid] = expiry_time
-            save_uids_to_file()  # حفظ التغييرات بعد الإضافة
+            save_uids_to_file()
+        
         return jsonify({
+            'success': True,
             'message': '✅ تم إضافة UID بنجاح',
             'uid': uid,
             'expires_at': expiry_time if not permanent else 'لا ينتهي أبداً',
-            'time_unit': time_unit if not permanent else 'permanent',
-            'time_value': time_value if not permanent else None,
+            'duration': time_display,
             'api_response': result
         }), status
     else:
-        return jsonify(result), status
+        return jsonify({
+            'success': False,
+            'error': result
+        }), status
 
 @app.route('/remaining_time/<string:uid>', methods=['GET'])
 def remaining_time(uid):
@@ -192,7 +210,7 @@ def remaining_time(uid):
         return jsonify({
             'uid': uid,
             'status': 'permanent',
-            'message': 'هذا الـ UID دائم ولا ينتهي أبداً'
+            'message': '✨ هذا الـ UID دائم ولا ينتهي أبداً'
         })
     
     try:
@@ -200,17 +218,25 @@ def remaining_time(uid):
         now = datetime.now()
         
         if now > exp_time:
-            return jsonify({'error': '⏰ هذا الـ UID قد انتهى صلاحيته'}), 400
+            return jsonify({
+                'error': '⏰ هذا الـ UID قد انتهى صلاحيته',
+                'expired_at': expiry
+            }), 400
         
         remaining = exp_time - now
         days = remaining.days
         hours, rem = divmod(remaining.seconds, 3600)
         minutes, seconds = divmod(rem, 60)
         
+        # حساب إجمالي الثواني
+        total_seconds = int(remaining.total_seconds())
+        
         return jsonify({
             'uid': uid,
+            'status': 'active',
             'expires_at': expiry,
             'time_remaining': f"{days} أيام, {hours} ساعات, {minutes} دقائق, {seconds} ثوانٍ",
+            'total_seconds': total_seconds,
             'details': {
                 'days': days,
                 'hours': hours,
@@ -218,19 +244,29 @@ def remaining_time(uid):
                 'seconds': seconds
             }
         })
-    except:
-        return jsonify({'error': 'خطأ في تنسيق الوقت'}), 500
+    except Exception as e:
+        return jsonify({'error': f'خطأ في تنسيق الوقت: {str(e)}'}), 500
 
-@app.route('/delete_uid/<string:uid>', methods=['GET'])
+@app.route('/delete_uid/<string:uid>', methods=['GET', 'DELETE'])
 def delete_uid(uid):
     """حذف UID يدوياً"""
+    with cache_lock:
+        if uid not in uids_cache:
+            return jsonify({'error': f'❌ الـ UID {uid} غير موجود'}), 404
+    
     if delete_uid_from_api(uid):
         with cache_lock:
             uids_cache.pop(uid, None)
-            save_uids_to_file()  # حفظ التغييرات بعد الحذف
-        return jsonify({'message': f'✅ تم حذف الـ UID {uid}'})
+            save_uids_to_file()
+        return jsonify({
+            'success': True,
+            'message': f'✅ تم حذف الـ UID {uid} بنجاح'
+        })
     else:
-        return jsonify({'error': f'❌ فشل حذف الـ UID {uid} - تأكد من صحة الرابط'}), 500
+        return jsonify({
+            'success': False,
+            'error': f'❌ فشل حذف الـ UID {uid} من API'
+        }), 500
 
 @app.route('/list_uids', methods=['GET'])
 def list_uids():
@@ -238,15 +274,72 @@ def list_uids():
     with cache_lock:
         uids_list = list(uids_cache.keys())
         uids_details = {}
+        
         for uid, expiry in uids_cache.items():
-            uids_details[uid] = {
-                'expiry': expiry,
-                'is_permanent': expiry == 'permanent'
-            }
+            if expiry == 'permanent':
+                uids_details[uid] = {
+                    'expiry': 'permanent',
+                    'is_permanent': True,
+                    'status': 'دائم'
+                }
+            else:
+                try:
+                    exp_time = datetime.strptime(expiry, '%Y-%m-%d %H:%M:%S')
+                    now = datetime.now()
+                    if now > exp_time:
+                        status = 'منتهي'
+                    else:
+                        remaining = exp_time - now
+                        status = f"ينتهي بعد {remaining.days} أيام"
+                except:
+                    status = 'غير معروف'
+                
+                uids_details[uid] = {
+                    'expiry': expiry,
+                    'is_permanent': False,
+                    'status': status
+                }
+    
     return jsonify({
-        'total': len(uids_list), 
+        'total': len(uids_list),
         'uids': uids_list,
-        'details': uids_details
+        'details': uids_details,
+        'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
+
+@app.route('/cleanup_now', methods=['GET'])
+def cleanup_now():
+    """تنظيف فوري للـ UIDs منتهية الصلاحية"""
+    print("🧹 بدء التنظيف الفوري...")
+    
+    current_time = datetime.now()
+    expired_uids = []
+    
+    with cache_lock:
+        for uid, expiry_str in list(uids_cache.items()):
+            if expiry_str != 'permanent':
+                try:
+                    exp_time = datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
+                    if current_time > exp_time:
+                        expired_uids.append(uid)
+                except:
+                    pass
+    
+    deleted = []
+    for uid in expired_uids:
+        if delete_uid_from_api(uid):
+            with cache_lock:
+                if uid in uids_cache:
+                    del uids_cache[uid]
+                    deleted.append(uid)
+    
+    if deleted:
+        save_uids_to_file()
+    
+    return jsonify({
+        'message': f'🧹 تم تنظيف {len(deleted)} UID منتهي الصلاحية',
+        'deleted_uids': deleted,
+        'remaining_uids': len(uids_cache)
     })
 
 @app.route('/backup', methods=['GET'])
@@ -265,6 +358,7 @@ def backup_data():
             json.dump(backup_data, f, ensure_ascii=False, indent=2)
         
         return jsonify({
+            'success': True,
             'message': '✅ تم إنشاء النسخة الاحتياطية',
             'file': backup_file,
             'total_uids': len(uids_cache)
@@ -272,26 +366,65 @@ def backup_data():
     except Exception as e:
         return jsonify({'error': f'فشل إنشاء النسخة: {e}'}), 500
 
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    """إحصائيات عن الـ UIDs"""
+    with cache_lock:
+        permanent = sum(1 for v in uids_cache.values() if v == 'permanent')
+        temporary = len(uids_cache) - permanent
+        expired = 0
+        
+        now = datetime.now()
+        for expiry in uids_cache.values():
+            if expiry != 'permanent':
+                try:
+                    if datetime.strptime(expiry, '%Y-%m-%d %H:%M:%S') < now:
+                        expired += 1
+                except:
+                    pass
+    
+    return jsonify({
+        'total_uids': len(uids_cache),
+        'permanent_uids': permanent,
+        'temporary_uids': temporary,
+        'expired_uids': expired,
+        'active_uids': temporary - expired,
+        'storage_file': STORAGE_FILE,
+        'cleanup_interval': f"{CLEANUP_INTERVAL} ثانية"
+    })
+
 @app.route('/')
 def home():
     return jsonify({
-        'service': '🚀 UID Manager',
+        'service': '🚀 UID Manager - نظام إدارة الـ UIDs',
+        'version': '2.0',
         'storage_file': STORAGE_FILE,
         'add_api': ADD_API_URL,
         'remove_api': REMOVE_API_URL,
         'supported_time_units': ['seconds', 'minutes', 'hours', 'days', 'months', 'years'],
+        'auto_cleanup': f'كل {CLEANUP_INTERVAL} ثانية',
         'commands': {
-            'add_permanent': '/add_uid?uid=ID&permanent=true',
-            'add_seconds': '/add_uid?uid=ID&time=30&type=seconds',
-            'add_minutes': '/add_uid?uid=ID&time=5&type=minutes',
-            'add_hours': '/add_uid?uid=ID&time=2&type=hours',
-            'add_days': '/add_uid?uid=ID&time=5&type=days',
-            'add_months': '/add_uid?uid=ID&time=1&type=months',
-            'add_years': '/add_uid?uid=ID&time=1&type=years',
-            'check': '/remaining_time/ID',
-            'delete': '/delete_uid/ID',
-            'list': '/list_uids',
-            'backup': '/backup'
+            'إضافة UID': {
+                'دائم': '/add_uid?uid=ID&permanent=true',
+                'ثواني': '/add_uid?uid=ID&time=30&type=seconds',
+                'دقائق': '/add_uid?uid=ID&time=5&type=minutes',
+                'ساعات': '/add_uid?uid=ID&time=2&type=hours',
+                'أيام': '/add_uid?uid=ID&time=5&type=days',
+                'شهور': '/add_uid?uid=ID&time=1&type=months',
+                'سنوات': '/add_uid?uid=ID&time=1&type=years'
+            },
+            'التحقق': {
+                'الوقت المتبقي': '/remaining_time/ID'
+            },
+            'الحذف': {
+                'يدوي': '/delete_uid/ID'
+            },
+            'الإدارة': {
+                'قائمة UIDs': '/list_uids',
+                'تنظيف فوري': '/cleanup_now',
+                'نسخة احتياطية': '/backup',
+                'إحصائيات': '/stats'
+            }
         }
     })
 
@@ -299,23 +432,25 @@ if __name__ == '__main__':
     # تحميل البيانات المحفوظة عند بدء التشغيل
     load_uids_from_file()
     
-    print("\n" + "="*60)
-    print("🚀 UID MANAGER - مع حفظ البيانات في ملف")
-    print("="*60)
+    print("\n" + "="*70)
+    print("🚀 UID MANAGER - نظام إدارة الـ UIDs مع تخزين محلي")
+    print("="*70)
     print(f"\n📁 ملف التخزين: {STORAGE_FILE}")
     print(f"📡 واجهة الإضافة: {ADD_API_URL}")
     print(f"📡 واجهة الحذف: {REMOVE_API_URL}")
+    print(f"⏰ تنظيف تلقائي: كل {CLEANUP_INTERVAL} ثانية")
     print(f"\n📊 تم تحميل {len(uids_cache)} UID من الملف")
-    print("\n📋 أوامر الإضافة:")
-    print("   /add_uid?uid=123&permanent=true        (دائم)")
-    print("   /add_uid?uid=123&time=30&type=seconds  (30 ثانية)")
-    print("   /add_uid?uid=123&time=5&type=minutes   (5 دقائق)")
-    print("   /add_uid?uid=123&time=2&type=hours     (2 ساعة)")
-    print("   /add_uid?uid=123&time=5&type=days      (5 أيام)")
-    print("\n📋 أوامر أخرى:")
-    print("   /remaining_time/123")
-    print("   /delete_uid/123")
-    print("   /list_uids")
-    print("   /backup                           (نسخة احتياطية)")
-    print("\n" + "="*60)
+    print("\n📋 الأوامر المتاحة:")
+    print("   ➕ /add_uid?uid=123&permanent=true")
+    print("   ➕ /add_uid?uid=123&time=30&type=seconds")
+    print("   🔍 /remaining_time/123")
+    print("   🗑️ /delete_uid/123")
+    print("   📋 /list_uids")
+    print("   🧹 /cleanup_now")
+    print("   💾 /backup")
+    print("   📊 /stats")
+    print("\n" + "="*70)
+    print("🌐 الخادم يعمل على http://0.0.0.0:50022")
+    print("="*70 + "\n")
+    
     app.run(host='0.0.0.0', port=50022, debug=False)
